@@ -1,121 +1,112 @@
 import express from "express";
 import { WebClient } from "@slack/web-api";
 import Anthropic from "@anthropic-ai/sdk";
+import crypto from "crypto";
 
 const app = express();
-app.use(express.json());
-
 const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-const MY_SLACK_USER_ID = process.env.MY_SLACK_USER_ID; // e.g. "U012AB3CD"
-const POLL_INTERVAL_MS = 60_000; // check every 60 seconds
+const MY_SLACK_USER_ID = process.env.MY_SLACK_USER_ID;
+const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
 
-// Remember the last timestamp we processed so we don't re-process mentions
-let lastChecked = (Date.now() / 1000).toFixed(6);
-
-// ── Core: fetch new mentions ────────────────────────────────────────────────
-async function fetchNewMentions() {
-  const res = await slack.search.messages({
-    query: `<@${MY_SLACK_USER_ID}>`,
-    sort: "timestamp",
-    sort_dir: "desc",
-    count: 10,
-  });
-
-  const messages = res.messages?.matches ?? [];
-  return messages.filter((m) => parseFloat(m.ts) > parseFloat(lastChecked));
+// ── Verify requests are genuinely from Slack ─────────────────────────────────
+function verifySlack(req) {
+  const ts = req.headers["x-slack-request-timestamp"];
+  const sig = req.headers["x-slack-signature"];
+  if (Math.abs(Date.now() / 1000 - ts) > 300) return false;
+  const base = `v0:${ts}:${JSON.stringify(req.body)}`;
+  const hash = "v0=" + crypto.createHmac("sha256", SLACK_SIGNING_SECRET).update(base).digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(sig));
 }
 
-// ── Core: draft a reply with Claude ─────────────────────────────────────────
-async function draftReply(mention) {
-  const prompt = `You are helping me (a professional) draft a reply to a Slack message where I was mentioned.
-
-Channel: #${mention.channel?.name ?? "unknown"}
-From: ${mention.username ?? "someone"}
-Message: "${mention.text}"
-
-Write a concise, professional reply I could send. Keep it 1–3 sentences. 
-Don't include any preamble like "Here's a draft:" — just the reply text itself.`;
-
+// ── Draft a reply with Claude ────────────────────────────────────────────────
+async function draftReply(text, user, channel) {
   const msg = await anthropic.messages.create({
     model: "claude-sonnet-4-20250514",
     max_tokens: 300,
-    messages: [{ role: "user", content: prompt }],
-  });
+    messages: [{
+      role: "user",
+      content: `You are helping me draft a reply to a Slack message where I was mentioned.
 
+Channel ID: ${channel}
+From user ID: ${user}
+Message: "${text}"
+
+Write a concise, professional reply I could send back. Keep it 1–3 sentences.
+Reply with just the reply text — no preamble.`
+    }]
+  });
   return msg.content[0].text.trim();
 }
 
-// ── Core: DM me the draft ────────────────────────────────────────────────────
-async function dmDraft(mention, draft) {
-  const channelLink = mention.permalink
-    ? `<${mention.permalink}|View message>`
-    : `in #${mention.channel?.name ?? "unknown"}`;
-
+// ── DM me the draft ──────────────────────────────────────────────────────────
+async function dmDraft(event, draft) {
   await slack.chat.postMessage({
-    channel: MY_SLACK_USER_ID, // DM to yourself
-    text: `📬 *New mention* ${channelLink}`,
+    channel: MY_SLACK_USER_ID,
+    text: `📬 New mention from <@${event.user}>`,
     blocks: [
       {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `📬 *New mention* ${channelLink}\n\n*They said:*\n> ${mention.text}`,
-        },
+          text: `📬 *New mention* from <@${event.user}> in <#${event.channel}>\n\n*They said:*\n> ${event.text}`
+        }
       },
       {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `*✏️ Draft reply:*\n\`\`\`${draft}\`\`\``,
-        },
+          text: `*✏️ Draft reply:*\n\`\`\`${draft}\`\`\``
+        }
       },
       {
         type: "context",
-        elements: [
-          {
-            type: "mrkdwn",
-            text: `Copy the draft above, edit if needed, then reply in the original thread.`,
-          },
-        ],
-      },
-    ],
+        elements: [{
+          type: "mrkdwn",
+          text: "Copy the draft, edit if needed, then reply in the original thread."
+        }]
+      }
+    ]
   });
 }
 
-// ── Polling loop ─────────────────────────────────────────────────────────────
-async function poll() {
-  try {
-    console.log(`[${new Date().toISOString()}] Checking for new mentions...`);
-    const mentions = await fetchNewMentions();
+// ── Raw body needed for Slack signature verification ─────────────────────────
+app.use(express.json({
+  verify: (req, _res, buf) => { req.rawBody = buf; }
+}));
 
-    if (mentions.length === 0) {
-      console.log("  No new mentions.");
-    }
+// ── Main webhook endpoint ────────────────────────────────────────────────────
+app.post("/slack/events", async (req, res) => {
+  const body = req.body;
 
-    for (const mention of mentions) {
-      console.log(`  New mention from ${mention.username}: "${mention.text.slice(0, 60)}..."`);
-      const draft = await draftReply(mention);
-      await dmDraft(mention, draft);
-      console.log("  Draft sent via DM ✓");
-      // Advance the cursor so we don't re-process this one
-      if (parseFloat(mention.ts) > parseFloat(lastChecked)) {
-        lastChecked = mention.ts;
-      }
-    }
-  } catch (err) {
-    console.error("Poll error:", err.message);
+  // Slack sends a one-time URL verification challenge
+  if (body.type === "url_verification") {
+    return res.json({ challenge: body.challenge });
   }
-}
 
-// ── Health check endpoint (required by Render/Railway) ───────────────────────
+  // Verify the request came from Slack
+  if (!verifySlack(req)) {
+    return res.status(401).send("Unauthorized");
+  }
+
+  res.sendStatus(200); // always ack immediately
+
+  const event = body.event;
+  if (event?.type === "app_mention") {
+    try {
+      console.log(`Mention from ${event.user}: "${event.text}"`);
+      const draft = await draftReply(event.text, event.user, event.channel);
+      await dmDraft(event, draft);
+      console.log("Draft sent via DM ✓");
+    } catch (err) {
+      console.error("Error handling mention:", err.message);
+    }
+  }
+});
+
+// ── Health check ─────────────────────────────────────────────────────────────
 app.get("/", (_req, res) => res.send("Slack mention agent is running ✓"));
 
-// ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT ?? 3000;
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-  poll(); // run immediately on start
-  setInterval(poll, POLL_INTERVAL_MS);
-});
+app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
